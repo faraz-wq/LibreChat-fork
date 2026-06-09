@@ -1,0 +1,3 @@
+[submodule "librechat-admin-panel"]
+	path = librechat-admin-panel
+	url = git@github.com:faraz-wq/LibreChat-admin-panel-fork.git
