@@ -1043,6 +1043,9 @@ export async function createRun({
     ...(enableToolOutputReferences && {
       toolOutputReferences: { enabled: true },
     }),
+    ...(process.env.CODE_EXECUTION_ENGINE === 'local' && {
+      toolExecution: { engine: 'local' as const },
+    }),
   });
 
   applyTestRunHook(run, { messages, agents });

@@ -1,0 +1,1257 @@
+// src/specs/agent-handoffs.test.ts
+import { DynamicStructuredTool } from '@langchain/core/tools';
+import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
+import type { ToolCall } from '@langchain/core/messages/tool';
+import type { RunnableConfig } from '@langchain/core/runnables';
+import type * as t from '@/types';
+import { Providers, GraphEvents, Constants } from '@/common';
+import { StandardGraph } from '@/graphs/Graph';
+import { ToolNode } from '@/tools/ToolNode';
+import * as events from '@/utils/events';
+import { Run } from '@/run';
+
+/**
+ * Helper to safely get tool name from tool object
+ */
+const getToolName = (tool: t.GraphTools[0]): string | undefined => {
+  return (tool as { name?: string }).name;
+};
+
+/**
+ * Helper to safely get tool description from tool object
+ */
+const getToolDescription = (tool: t.GraphTools[0]): string | undefined => {
+  return (tool as { description?: string }).description;
+};
+
+/**
+ * Helper to safely get tool schema from tool object
+ */
+const getToolSchema = (tool: t.GraphTools[0]): unknown => {
+  return (tool as { schema?: unknown }).schema;
+};
+
+/**
+ * Helper to find tool by name
+ */
+const findToolByName = (
+  tools: t.GraphTools | undefined,
+  name: string
+): t.GraphTools[0] | undefined => {
+  return tools?.find((tool) => getToolName(tool) === name);
+};
+
+/**
+ * Test suite for Agent Handoffs feature
+ *
+ * Tests cover:
+ * - Basic handoff between two agents
+ * - Handoffs with custom descriptions
+ * - Handoffs with prompts and prompt keys
+ * - Sequential handoffs (A -> B -> C)
+ * - Bidirectional handoffs (A <-> B)
+ * - Multiple handoff options from single agent
+ * - Handoff tool creation and execution
+ * - Error cases and edge conditions
+ */
+describe('Agent Handoffs Tests', () => {
+  jest.setTimeout(30000);
+
+  const createTestConfig = (
+    agents: t.AgentInputs[],
+    edges: t.GraphEdge[]
+  ): t.RunConfig => ({
+    runId: `handoff-test-${Date.now()}-${Math.random()}`,
+    graphConfig: {
+      type: 'multi-agent',
+      agents,
+      edges,
+    },
+    returnContent: true,
+    skipCleanup: true,
+  });
+
+  const createBasicAgent = (
+    agentId: string,
+    instructions: string
+  ): t.AgentInputs => ({
+    agentId,
+    provider: Providers.ANTHROPIC,
+    clientOptions: {
+      modelName: 'claude-haiku-4-5',
+      apiKey: 'test-key',
+    },
+    instructions,
+    maxContextTokens: 28000,
+  });
+
+  describe('Basic Handoff Tests', () => {
+    it('should create handoff tool for agent with outgoing handoff edge', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('agent_a', 'You are agent A'),
+        createBasicAgent('agent_b', 'You are agent B'),
+      ];
+
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'agent_a',
+          to: 'agent_b',
+          edgeType: 'handoff',
+          description: 'Transfer to agent B',
+        },
+      ];
+
+      const run = await Run.create(createTestConfig(agents, edges));
+
+      expect(run.Graph).toBeDefined();
+
+      const agentAContext = (run.Graph as StandardGraph).agentContexts.get(
+        'agent_a'
+      );
+      expect(agentAContext).toBeDefined();
+      expect(agentAContext?.graphTools).toBeDefined();
+
+      // Check that handoff tool was created
+      const handoffTool = findToolByName(
+        agentAContext?.graphTools,
+        `${Constants.LC_TRANSFER_TO_}agent_b`
+      );
+      expect(handoffTool).toBeDefined();
+      expect(getToolDescription(handoffTool!)).toBe('Transfer to agent B');
+    });
+
+    it('should successfully handoff from agent A to agent B', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('agent_a', 'You are agent A. Transfer to agent B.'),
+        createBasicAgent('agent_b', 'You are agent B. Respond to the user.'),
+      ];
+
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'agent_a',
+          to: 'agent_b',
+          edgeType: 'handoff',
+          description: 'Transfer to agent B when needed',
+        },
+      ];
+
+      const run = await Run.create(createTestConfig(agents, edges));
+
+      // Override models to simulate handoff behavior
+      run.Graph?.overrideTestModel(
+        [
+          'Transferring to agent B', // Agent A response
+          'Hello from agent B', // Agent B response
+        ],
+        10,
+        [
+          {
+            id: 'tool_call_1',
+            name: `${Constants.LC_TRANSFER_TO_}agent_b`,
+            args: {},
+          } as ToolCall,
+        ]
+      );
+
+      const messages = [new HumanMessage('Hello')];
+
+      const config: Partial<RunnableConfig> & {
+        version: 'v1' | 'v2';
+        streamMode: string;
+      } = {
+        configurable: {
+          thread_id: 'test-handoff-thread',
+        },
+        streamMode: 'values',
+        version: 'v2' as const,
+      };
+
+      await run.processStream({ messages }, config);
+
+      const finalMessages = run.getRunMessages();
+      expect(finalMessages).toBeDefined();
+      expect(finalMessages!.length).toBeGreaterThan(1);
+
+      // Check for tool message indicating handoff
+      const toolMessages = finalMessages!.filter(
+        (msg) => msg.getType() === 'tool'
+      ) as ToolMessage[];
+
+      const handoffToolMessage = toolMessages.find(
+        (msg) => msg.name === `${Constants.LC_TRANSFER_TO_}agent_b`
+      );
+      expect(handoffToolMessage).toBeDefined();
+      expect(handoffToolMessage?.content).toContain('transferred to agent_b');
+    });
+
+    it('should not create handoff tool for agent without outgoing edges', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('agent_a', 'You are agent A'),
+        createBasicAgent('agent_b', 'You are agent B'),
+      ];
+
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'agent_a',
+          to: 'agent_b',
+          edgeType: 'handoff',
+        },
+      ];
+
+      const run = await Run.create(createTestConfig(agents, edges));
+
+      const agentBContext = (run.Graph as StandardGraph).agentContexts.get(
+        'agent_b'
+      );
+      expect(agentBContext).toBeDefined();
+
+      // Agent B should not have handoff tools (no outgoing edges)
+      const handoffTools = agentBContext?.graphTools?.filter((tool) => {
+        const name = getToolName(tool);
+        return name?.startsWith(Constants.LC_TRANSFER_TO_) ?? false;
+      });
+      expect(handoffTools?.length ?? 0).toBe(0);
+    });
+  });
+
+  describe('Bidirectional Handoffs', () => {
+    it('should create handoff tools for both agents in bidirectional setup', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('agent_a', 'You are agent A'),
+        createBasicAgent('agent_b', 'You are agent B'),
+      ];
+
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'agent_a',
+          to: 'agent_b',
+          edgeType: 'handoff',
+          description: 'Transfer to agent B',
+        },
+        {
+          from: 'agent_b',
+          to: 'agent_a',
+          edgeType: 'handoff',
+          description: 'Transfer to agent A',
+        },
+      ];
+
+      const run = await Run.create(createTestConfig(agents, edges));
+
+      const agentAContext = (run.Graph as StandardGraph).agentContexts.get(
+        'agent_a'
+      );
+      const agentBContext = (run.Graph as StandardGraph).agentContexts.get(
+        'agent_b'
+      );
+
+      // Agent A should have tool to transfer to B
+      const agentAHandoffTool = findToolByName(
+        agentAContext?.graphTools,
+        `${Constants.LC_TRANSFER_TO_}agent_b`
+      );
+      expect(agentAHandoffTool).toBeDefined();
+
+      // Agent B should have tool to transfer to A
+      const agentBHandoffTool = findToolByName(
+        agentBContext?.graphTools,
+        `${Constants.LC_TRANSFER_TO_}agent_a`
+      );
+      expect(agentBHandoffTool).toBeDefined();
+    });
+
+    it('should handle handoff from A to B in bidirectional setup', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('agent_a', 'You are agent A'),
+        createBasicAgent('agent_b', 'You are agent B'),
+      ];
+
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'agent_a',
+          to: 'agent_b',
+          edgeType: 'handoff',
+        },
+        {
+          from: 'agent_b',
+          to: 'agent_a',
+          edgeType: 'handoff',
+        },
+      ];
+
+      const run = await Run.create(createTestConfig(agents, edges));
+
+      // Simulate single handoff from A to B
+      run.Graph?.overrideTestModel(
+        ['Transferring to B', 'Response from B'],
+        10,
+        [
+          {
+            id: 'tool_call_1',
+            name: `${Constants.LC_TRANSFER_TO_}agent_b`,
+            args: {},
+          } as ToolCall,
+        ]
+      );
+
+      const messages = [new HumanMessage('Start conversation')];
+
+      const config: Partial<RunnableConfig> & {
+        version: 'v1' | 'v2';
+        streamMode: string;
+      } = {
+        configurable: {
+          thread_id: 'test-bidirectional-thread',
+        },
+        streamMode: 'values',
+        version: 'v2' as const,
+      };
+
+      await run.processStream({ messages }, config);
+
+      const finalMessages = run.getRunMessages();
+      expect(finalMessages).toBeDefined();
+
+      // Should have a handoff tool message
+      const toolMessages = finalMessages!.filter(
+        (msg) => msg.getType() === 'tool'
+      ) as ToolMessage[];
+
+      const handoffMessage = toolMessages.find(
+        (msg) => msg.name === `${Constants.LC_TRANSFER_TO_}agent_b`
+      );
+      expect(handoffMessage).toBeDefined();
+    });
+  });
+
+  describe('Sequential Handoffs (Chain)', () => {
+    it('should create handoff tools for chain of agents A -> B -> C', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('agent_a', 'You are agent A'),
+        createBasicAgent('agent_b', 'You are agent B'),
+        createBasicAgent('agent_c', 'You are agent C'),
+      ];
+
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'agent_a',
+          to: 'agent_b',
+          edgeType: 'handoff',
+          description: 'Transfer to agent B',
+        },
+        {
+          from: 'agent_b',
+          to: 'agent_c',
+          edgeType: 'handoff',
+          description: 'Transfer to agent C',
+        },
+      ];
+
+      const run = await Run.create(createTestConfig(agents, edges));
+
+      const agentAContext = (run.Graph as StandardGraph).agentContexts.get(
+        'agent_a'
+      );
+      const agentBContext = (run.Graph as StandardGraph).agentContexts.get(
+        'agent_b'
+      );
+      const agentCContext = (run.Graph as StandardGraph).agentContexts.get(
+        'agent_c'
+      );
+
+      // Agent A should have tool to transfer to B
+      expect(
+        findToolByName(
+          agentAContext?.graphTools,
+          `${Constants.LC_TRANSFER_TO_}agent_b`
+        )
+      ).toBeDefined();
+
+      // Agent B should have tool to transfer to C
+      expect(
+        findToolByName(
+          agentBContext?.graphTools,
+          `${Constants.LC_TRANSFER_TO_}agent_c`
+        )
+      ).toBeDefined();
+
+      // Agent C should have no handoff tools
+      const agentCHandoffTools = agentCContext?.graphTools?.filter((tool) => {
+        const name = getToolName(tool);
+        return name?.startsWith(Constants.LC_TRANSFER_TO_) ?? false;
+      });
+      expect(agentCHandoffTools?.length ?? 0).toBe(0);
+    });
+  });
+
+  describe('Multiple Handoff Options', () => {
+    it('should create multiple handoff tools when agent has multiple outgoing edges', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('router', 'You are a router agent'),
+        createBasicAgent('agent_a', 'You are agent A'),
+        createBasicAgent('agent_b', 'You are agent B'),
+        createBasicAgent('agent_c', 'You are agent C'),
+      ];
+
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'router',
+          to: 'agent_a',
+          edgeType: 'handoff',
+          description: 'Transfer to agent A for task A',
+        },
+        {
+          from: 'router',
+          to: 'agent_b',
+          edgeType: 'handoff',
+          description: 'Transfer to agent B for task B',
+        },
+        {
+          from: 'router',
+          to: 'agent_c',
+          edgeType: 'handoff',
+          description: 'Transfer to agent C for task C',
+        },
+      ];
+
+      const run = await Run.create(createTestConfig(agents, edges));
+
+      const routerContext = (run.Graph as StandardGraph).agentContexts.get(
+        'router'
+      );
+      expect(routerContext).toBeDefined();
+
+      // Router should have 3 handoff tools
+      const handoffTools = routerContext?.graphTools?.filter((tool) => {
+        const name = getToolName(tool);
+        return name?.startsWith(Constants.LC_TRANSFER_TO_) ?? false;
+      });
+      expect(handoffTools?.length).toBe(3);
+
+      // Verify each tool exists
+      expect(
+        findToolByName(handoffTools, `${Constants.LC_TRANSFER_TO_}agent_a`)
+      ).toBeDefined();
+      expect(
+        findToolByName(handoffTools, `${Constants.LC_TRANSFER_TO_}agent_b`)
+      ).toBeDefined();
+      expect(
+        findToolByName(handoffTools, `${Constants.LC_TRANSFER_TO_}agent_c`)
+      ).toBeDefined();
+    });
+
+    it('should route to correct agent based on handoff tool used', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('router', 'You are a router'),
+        createBasicAgent('agent_a', 'You are agent A'),
+        createBasicAgent('agent_b', 'You are agent B'),
+      ];
+
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'router',
+          to: 'agent_a',
+          edgeType: 'handoff',
+          description: 'Transfer to agent A',
+        },
+        {
+          from: 'router',
+          to: 'agent_b',
+          edgeType: 'handoff',
+          description: 'Transfer to agent B',
+        },
+      ];
+
+      const run = await Run.create(createTestConfig(agents, edges));
+
+      // Router chooses agent_b
+      run.Graph?.overrideTestModel(
+        ['Routing to agent B', 'Hello from agent B'],
+        10,
+        [
+          {
+            id: 'tool_call_1',
+            name: `${Constants.LC_TRANSFER_TO_}agent_b`,
+            args: {},
+          } as ToolCall,
+        ]
+      );
+
+      const messages = [new HumanMessage('Route this message')];
+
+      const config: Partial<RunnableConfig> & {
+        version: 'v1' | 'v2';
+        streamMode: string;
+      } = {
+        configurable: {
+          thread_id: 'test-routing-thread',
+        },
+        streamMode: 'values',
+        version: 'v2' as const,
+      };
+
+      await run.processStream({ messages }, config);
+
+      const finalMessages = run.getRunMessages();
+      const toolMessages = finalMessages!.filter(
+        (msg) => msg.getType() === 'tool'
+      ) as ToolMessage[];
+
+      // Should have handoff to agent_b, not agent_a
+      const handoffToB = toolMessages.find(
+        (msg) => msg.name === `${Constants.LC_TRANSFER_TO_}agent_b`
+      );
+      expect(handoffToB).toBeDefined();
+
+      const handoffToA = toolMessages.find(
+        (msg) => msg.name === `${Constants.LC_TRANSFER_TO_}agent_a`
+      );
+      expect(handoffToA).toBeUndefined();
+    });
+  });
+
+  describe('Handoffs with Prompts', () => {
+    it('should create handoff tool with prompt parameter when prompt is specified', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('agent_a', 'You are agent A'),
+        createBasicAgent('agent_b', 'You are agent B'),
+      ];
+
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'agent_a',
+          to: 'agent_b',
+          edgeType: 'handoff',
+          description: 'Transfer to agent B with instructions',
+          prompt: 'Provide specific instructions for agent B',
+          promptKey: 'instructions',
+        },
+      ];
+
+      const run = await Run.create(createTestConfig(agents, edges));
+
+      const agentAContext = (run.Graph as StandardGraph).agentContexts.get(
+        'agent_a'
+      );
+      const handoffTool = findToolByName(
+        agentAContext?.graphTools,
+        `${Constants.LC_TRANSFER_TO_}agent_b`
+      );
+
+      expect(handoffTool).toBeDefined();
+      // Tool should accept parameters (schema should be defined)
+      expect(getToolSchema(handoffTool!)).toBeDefined();
+    });
+
+    it('should use default promptKey when not specified', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('agent_a', 'You are agent A'),
+        createBasicAgent('agent_b', 'You are agent B'),
+      ];
+
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'agent_a',
+          to: 'agent_b',
+          edgeType: 'handoff',
+          prompt: 'Instructions for handoff',
+          // promptKey not specified, should default to 'instructions'
+        },
+      ];
+
+      const run = await Run.create(createTestConfig(agents, edges));
+
+      const agentAContext = (run.Graph as StandardGraph).agentContexts.get(
+        'agent_a'
+      );
+      const handoffTool = findToolByName(
+        agentAContext?.graphTools,
+        `${Constants.LC_TRANSFER_TO_}agent_b`
+      );
+
+      expect(handoffTool).toBeDefined();
+      expect(getToolSchema(handoffTool!)).toBeDefined();
+    });
+
+    it('should include prompt content in handoff tool message', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('agent_a', 'You are agent A'),
+        createBasicAgent('agent_b', 'You are agent B'),
+      ];
+
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'agent_a',
+          to: 'agent_b',
+          edgeType: 'handoff',
+          description: 'Transfer to agent B',
+          prompt: 'Additional context for agent B',
+          promptKey: 'context',
+        },
+      ];
+
+      const run = await Run.create(createTestConfig(agents, edges));
+
+      run.Graph?.overrideTestModel(['Transferring with context'], 10, [
+        {
+          id: 'tool_call_1',
+          name: `${Constants.LC_TRANSFER_TO_}agent_b`,
+          args: { context: 'User needs help with booking' },
+        } as ToolCall,
+      ]);
+
+      const messages = [new HumanMessage('Help me')];
+
+      const config: Partial<RunnableConfig> & {
+        version: 'v1' | 'v2';
+        streamMode: string;
+      } = {
+        configurable: {
+          thread_id: 'test-prompt-thread',
+        },
+        streamMode: 'values',
+        version: 'v2' as const,
+      };
+
+      await run.processStream({ messages }, config);
+
+      const finalMessages = run.getRunMessages();
+      const toolMessages = finalMessages!.filter(
+        (msg) => msg.getType() === 'tool'
+      ) as ToolMessage[];
+
+      const handoffMessage = toolMessages.find(
+        (msg) => msg.name === `${Constants.LC_TRANSFER_TO_}agent_b`
+      );
+
+      expect(handoffMessage).toBeDefined();
+      // Tool message should contain the prompt key and value
+      expect(handoffMessage?.content).toContain('Context:');
+    });
+  });
+
+  describe('Edge Cases and Error Handling', () => {
+    it('should handle self-referential edge gracefully', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('agent_a', 'You are agent A'),
+      ];
+
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'agent_a',
+          to: 'agent_a',
+          edgeType: 'handoff',
+          description: 'Self-handoff (should be allowed but unusual)',
+        },
+      ];
+
+      // Should not throw during creation
+      expect(async () => {
+        await Run.create(createTestConfig(agents, edges));
+      }).not.toThrow();
+    });
+
+    it('should handle empty edges array', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('agent_a', 'You are agent A'),
+        createBasicAgent('agent_b', 'You are agent B'),
+      ];
+
+      const edges: t.GraphEdge[] = [];
+
+      const run = await Run.create(createTestConfig(agents, edges));
+
+      expect(run.Graph).toBeDefined();
+
+      // Agents should have no handoff tools
+      const agentAContext = (run.Graph as StandardGraph).agentContexts.get(
+        'agent_a'
+      );
+      const handoffTools = agentAContext?.graphTools?.filter((tool) => {
+        const name = getToolName(tool);
+        return name?.startsWith(Constants.LC_TRANSFER_TO_) ?? false;
+      });
+      expect(handoffTools?.length ?? 0).toBe(0);
+    });
+
+    it('should start from first agent when no edges are defined', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('agent_a', 'You are agent A'),
+        createBasicAgent('agent_b', 'You are agent B'),
+      ];
+
+      const edges: t.GraphEdge[] = [];
+
+      const run = await Run.create(createTestConfig(agents, edges));
+
+      run.Graph?.overrideTestModel(['Response from first agent'], 10);
+
+      const messages = [new HumanMessage('Hello')];
+
+      const config: Partial<RunnableConfig> & {
+        version: 'v1' | 'v2';
+        streamMode: string;
+      } = {
+        configurable: {
+          thread_id: 'test-no-edges-thread',
+        },
+        streamMode: 'values',
+        version: 'v2' as const,
+      };
+
+      await run.processStream({ messages }, config);
+
+      const finalMessages = run.getRunMessages();
+      expect(finalMessages).toBeDefined();
+      expect(finalMessages!.length).toBeGreaterThan(0);
+    });
+
+    it('should handle agents with existing tools alongside handoff tools', async () => {
+      const customTool = new DynamicStructuredTool({
+        name: 'custom_tool',
+        description: 'A custom tool',
+        schema: { type: 'object', properties: {}, required: [] },
+        func: async (): Promise<string> => 'Tool result',
+      });
+
+      const agents: t.AgentInputs[] = [
+        {
+          ...createBasicAgent('agent_a', 'You are agent A'),
+          tools: [customTool],
+        },
+        createBasicAgent('agent_b', 'You are agent B'),
+      ];
+
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'agent_a',
+          to: 'agent_b',
+          edgeType: 'handoff',
+          description: 'Transfer to agent B',
+        },
+      ];
+
+      const run = await Run.create(createTestConfig(agents, edges));
+
+      const agentAContext = (run.Graph as StandardGraph).agentContexts.get(
+        'agent_a'
+      );
+
+      // Agent A should have custom tool in tools and handoff tool in graphTools
+      expect(findToolByName(agentAContext?.tools, 'custom_tool')).toBeDefined();
+
+      expect(
+        findToolByName(
+          agentAContext?.graphTools,
+          `${Constants.LC_TRANSFER_TO_}agent_b`
+        )
+      ).toBeDefined();
+    });
+  });
+
+  describe('Graph Structure Analysis', () => {
+    it('should correctly identify starting nodes with no incoming edges', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('agent_a', 'Starting agent'),
+        createBasicAgent('agent_b', 'Middle agent'),
+        createBasicAgent('agent_c', 'End agent'),
+      ];
+
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'agent_a',
+          to: 'agent_b',
+          edgeType: 'handoff',
+        },
+        {
+          from: 'agent_b',
+          to: 'agent_c',
+          edgeType: 'handoff',
+        },
+      ];
+
+      const run = await Run.create(createTestConfig(agents, edges));
+
+      // agent_a should be the starting node (no incoming edges)
+      expect(run.Graph).toBeDefined();
+      // This is internal behavior, but we can test via execution
+      run.Graph?.overrideTestModel(['Response from agent A'], 10);
+
+      const messages = [new HumanMessage('Start')];
+
+      const config: Partial<RunnableConfig> & {
+        version: 'v1' | 'v2';
+        streamMode: string;
+      } = {
+        configurable: {
+          thread_id: 'test-starting-node-thread',
+        },
+        streamMode: 'values',
+        version: 'v2' as const,
+      };
+
+      // Should start from agent_a
+      await run.processStream({ messages }, config);
+
+      const finalMessages = run.getRunMessages();
+      expect(finalMessages).toBeDefined();
+    });
+
+    it('should handle multiple starting nodes (parallel entry points)', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('agent_a', 'Starting agent A'),
+        createBasicAgent('agent_b', 'Starting agent B'),
+        createBasicAgent('agent_c', 'Shared destination'),
+      ];
+
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'agent_a',
+          to: 'agent_c',
+          edgeType: 'handoff',
+        },
+        {
+          from: 'agent_b',
+          to: 'agent_c',
+          edgeType: 'handoff',
+        },
+      ];
+
+      // Both agent_a and agent_b have no incoming edges, so both are starting nodes
+      const run = await Run.create(createTestConfig(agents, edges));
+
+      expect(run.Graph).toBeDefined();
+    });
+  });
+
+  describe('Tool Call Before Handoff (Issue #54)', () => {
+    it('should complete handoff when router calls a non-handoff tool in the same turn', async () => {
+      /**
+       * Reproduces the bug from issue #54:
+       * When a router calls a regular tool AND a handoff tool in the same turn,
+       * the filtered messages for the receiving agent end with a ToolMessage.
+       * Previously, instructions were appended as a HumanMessage (tool → user),
+       * which many APIs reject. The fix injects instructions into the last
+       * ToolMessage instead.
+       */
+      const customTool = new DynamicStructuredTool({
+        name: 'list_upload_sessions',
+        description: 'List available upload sessions',
+        schema: { type: 'object', properties: {}, required: [] },
+        func: async (): Promise<string> =>
+          JSON.stringify({ sessions: [{ id: 'sess_1', status: 'ready' }] }),
+      });
+
+      const agents: t.AgentInputs[] = [
+        {
+          ...createBasicAgent('router', 'You are a router'),
+          tools: [customTool],
+          toolMap: new Map([['list_upload_sessions', customTool]]) as t.ToolMap,
+        },
+        createBasicAgent('data_analyst', 'You are a data analyst'),
+      ];
+
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'router',
+          to: 'data_analyst',
+          edgeType: 'handoff',
+          description: 'Transfer to data analyst',
+          prompt: 'Instructions for the analyst about what to analyze',
+          promptKey: 'instructions',
+        },
+      ];
+
+      const run = await Run.create(createTestConfig(agents, edges));
+
+      /**
+       * Simulate router calling list_upload_sessions AND handoff in the same turn.
+       * The first model response includes both tool calls.
+       * The second model response is the data_analyst's reply.
+       */
+      run.Graph?.overrideTestModel(
+        [
+          'Checking available sessions and transferring to analyst',
+          'Here is my analysis of the available sessions',
+        ],
+        10,
+        [
+          {
+            id: 'tool_call_1',
+            name: 'list_upload_sessions',
+            args: {},
+          } as ToolCall,
+          {
+            id: 'tool_call_2',
+            name: `${Constants.LC_TRANSFER_TO_}data_analyst`,
+            args: { instructions: 'Analyze the upload session data' },
+          } as ToolCall,
+        ]
+      );
+
+      const messages = [
+        new HumanMessage('Check my upload sessions and analyze them'),
+      ];
+
+      const config: Partial<RunnableConfig> & {
+        version: 'v1' | 'v2';
+        streamMode: string;
+      } = {
+        configurable: {
+          thread_id: 'test-tool-before-handoff-thread',
+        },
+        streamMode: 'values',
+        version: 'v2' as const,
+      };
+
+      /**
+       * This should complete without error. Before the fix, the receiving
+       * agent would get an invalid tool → user message sequence.
+       */
+      await run.processStream({ messages }, config);
+
+      const finalMessages = run.getRunMessages();
+      expect(finalMessages).toBeDefined();
+      expect(finalMessages!.length).toBeGreaterThan(1);
+
+      /** Verify that the handoff occurred */
+      const toolMessages = finalMessages!.filter(
+        (msg) => msg.getType() === 'tool'
+      ) as ToolMessage[];
+
+      const handoffMessage = toolMessages.find(
+        (msg) => msg.name === `${Constants.LC_TRANSFER_TO_}data_analyst`
+      );
+      expect(handoffMessage).toBeDefined();
+
+      /** Verify the flow completed (agent B responded) */
+      const aiMessages = finalMessages!.filter((msg) => msg.getType() === 'ai');
+      expect(aiMessages.length).toBeGreaterThanOrEqual(1);
+    });
+  });
+
+  describe('Handoff Tool Naming', () => {
+    it('should use correct naming convention for handoff tools', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('flight_assistant', 'You handle flights'),
+        createBasicAgent('hotel_assistant', 'You handle hotels'),
+      ];
+
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'flight_assistant',
+          to: 'hotel_assistant',
+          edgeType: 'handoff',
+          description: 'Transfer to hotel booking',
+        },
+      ];
+
+      const run = await Run.create(createTestConfig(agents, edges));
+
+      const flightContext = (run.Graph as StandardGraph).agentContexts.get(
+        'flight_assistant'
+      );
+      const handoffTool = findToolByName(
+        flightContext?.graphTools,
+        `${Constants.LC_TRANSFER_TO_}hotel_assistant`
+      );
+
+      expect(handoffTool).toBeDefined();
+      expect(getToolName(handoffTool!)).toBe(
+        `${Constants.LC_TRANSFER_TO_}hotel_assistant`
+      );
+    });
+
+    it('should preserve agent ID format in tool names', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('agent_with_underscores', 'Agent with underscores'),
+        createBasicAgent('AgentWithCamelCase', 'Agent with camel case'),
+      ];
+
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'agent_with_underscores',
+          to: 'AgentWithCamelCase',
+          edgeType: 'handoff',
+        },
+      ];
+
+      const run = await Run.create(createTestConfig(agents, edges));
+
+      const agentContext = (run.Graph as StandardGraph).agentContexts.get(
+        'agent_with_underscores'
+      );
+      const handoffTool = findToolByName(
+        agentContext?.graphTools,
+        `${Constants.LC_TRANSFER_TO_}AgentWithCamelCase`
+      );
+
+      expect(handoffTool).toBeDefined();
+      expect(getToolName(handoffTool!)).toBe(
+        `${Constants.LC_TRANSFER_TO_}AgentWithCamelCase`
+      );
+    });
+
+    it('should return exact-name guidance for handoff names with extra suffixes', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('router', 'You are a router'),
+        createBasicAgent('data_analyst', 'You are a data analyst'),
+      ];
+
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'router',
+          to: 'data_analyst',
+          edgeType: 'handoff',
+        },
+      ];
+
+      const run = await Run.create(createTestConfig(agents, edges));
+      const correctName = `${Constants.LC_TRANSFER_TO_}data_analyst`;
+      const wrongName = `${correctName}_analyst`;
+
+      run.Graph?.overrideTestModel(
+        ['Trying to transfer', 'Stopping after invalid tool name'],
+        10,
+        [
+          {
+            id: 'tool_call_wrong_handoff',
+            name: wrongName,
+            args: { instructions: 'Analyze the uploaded data' },
+          } as ToolCall,
+        ]
+      );
+
+      const config: Partial<RunnableConfig> & {
+        version: 'v1' | 'v2';
+        streamMode: string;
+      } = {
+        configurable: {
+          thread_id: 'test-wrong-handoff-name-thread',
+        },
+        streamMode: 'values',
+        version: 'v2' as const,
+      };
+
+      await run.processStream(
+        { messages: [new HumanMessage('Please analyze my data')] },
+        config
+      );
+
+      const toolMessages = run
+        .getRunMessages()!
+        .filter((msg) => msg.getType() === 'tool') as ToolMessage[];
+      const wrongNameMessage = toolMessages.find(
+        (msg) => msg.name === wrongName
+      );
+
+      expect(wrongNameMessage).toBeDefined();
+      expect(wrongNameMessage?.status).toBe('error');
+      expect(wrongNameMessage?.content).toContain(
+        `Did you mean "${correctName}"`
+      );
+    });
+
+    it('should include toolMap handoffs when direct tool names are present', async () => {
+      const correctName = `${Constants.LC_TRANSFER_TO_}data_analyst`;
+      const wrongName = `${correctName}_analyst`;
+      const handoffTool = new DynamicStructuredTool({
+        name: correctName,
+        description: 'Transfer to data analyst',
+        schema: { type: 'object', properties: {}, required: [] },
+        func: async (): Promise<string> => 'transferred',
+      }) as t.GenericTool;
+      const node = new ToolNode({
+        tools: [handoffTool],
+        directToolNames: new Set(['execute_code']),
+      });
+      const result = (await node.invoke({
+        messages: [
+          new AIMessage({
+            content: '',
+            tool_calls: [{ id: 'wrong_handoff', name: wrongName, args: {} }],
+          }),
+        ],
+      })) as { messages: ToolMessage[] };
+      const wrongNameMessage = result.messages.find(
+        (msg) => msg.tool_call_id === 'wrong_handoff'
+      );
+
+      expect(wrongNameMessage).toBeDefined();
+      expect(wrongNameMessage?.status).toBe('error');
+      expect(wrongNameMessage?.content).toContain(
+        `Did you mean "${correctName}"`
+      );
+    });
+
+    it('should keep event-driven unknown handoffs local without direct tool names', async () => {
+      const executedToolNames: string[] = [];
+      const correctName = `${Constants.LC_TRANSFER_TO_}data_analyst`;
+      const wrongName = `${correctName}_analyst`;
+      const lookupName = 'lookup_sessions';
+      const handoffTool = new DynamicStructuredTool({
+        name: correctName,
+        description: 'Transfer to data analyst',
+        schema: { type: 'object', properties: {}, required: [] },
+        func: async (): Promise<string> => 'transferred',
+      }) as t.GenericTool;
+      const lookupTool = new DynamicStructuredTool({
+        name: lookupName,
+        description: 'List upload sessions',
+        schema: { type: 'object', properties: {}, required: [] },
+        func: async (): Promise<string> => 'sessions',
+      }) as t.GenericTool;
+      const dispatchSpy = jest
+        .spyOn(events, 'safeDispatchCustomEvent')
+        .mockImplementation(async (event, data): Promise<void> => {
+          if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+            return;
+          }
+          const batch = data as t.ToolExecuteBatchRequest;
+          executedToolNames.push(
+            ...batch.toolCalls.map((toolCall) => toolCall.name)
+          );
+          batch.resolve(
+            batch.toolCalls.map((toolCall) => ({
+              toolCallId: toolCall.id,
+              status: 'success' as const,
+              content: `host result for ${toolCall.name}`,
+            }))
+          );
+        });
+      const node = new ToolNode({
+        tools: [handoffTool, lookupTool],
+        eventDrivenMode: true,
+        toolCallStepIds: new Map([
+          ['lookup_call', 'step_lookup'],
+          ['wrong_handoff', 'step_wrong_handoff'],
+        ]),
+      });
+
+      try {
+        const result = (await node.invoke({
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [
+                { id: 'lookup_call', name: lookupName, args: {} },
+                { id: 'wrong_handoff', name: wrongName, args: {} },
+              ],
+            }),
+          ],
+        })) as { messages: ToolMessage[] };
+        const wrongNameMessage = result.messages.find(
+          (msg) => msg.tool_call_id === 'wrong_handoff'
+        );
+
+        expect(executedToolNames).toEqual([lookupName]);
+        expect(wrongNameMessage).toBeDefined();
+        expect(wrongNameMessage?.status).toBe('error');
+        expect(wrongNameMessage?.content).toContain(
+          `Did you mean "${correctName}"`
+        );
+      } finally {
+        dispatchSpy.mockRestore();
+      }
+    });
+
+    it('should not dispatch mistyped graph handoffs to event-driven tool hosts', async () => {
+      const executedToolNames: string[] = [];
+      const agents: t.AgentInputs[] = [
+        {
+          ...createBasicAgent('router', 'You are a router'),
+          toolDefinitions: [
+            {
+              name: 'lookup_sessions',
+              description: 'List upload sessions',
+              parameters: {
+                type: 'object',
+                properties: {},
+                required: [],
+              },
+            },
+          ],
+        },
+        createBasicAgent('data_analyst', 'You are a data analyst'),
+      ];
+
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'router',
+          to: 'data_analyst',
+          edgeType: 'handoff',
+        },
+      ];
+
+      const run = await Run.create({
+        ...createTestConfig(agents, edges),
+        customHandlers: {
+          [GraphEvents.ON_TOOL_EXECUTE]: {
+            handle: (_event: string, data: t.StreamEventData): void => {
+              const batch = data as t.ToolExecuteBatchRequest;
+              executedToolNames.push(
+                ...batch.toolCalls.map((toolCall) => toolCall.name)
+              );
+              batch.resolve(
+                batch.toolCalls.map((toolCall) => ({
+                  toolCallId: toolCall.id,
+                  status: 'success' as const,
+                  content: `host result for ${toolCall.name}`,
+                }))
+              );
+            },
+          },
+        },
+      });
+      const correctName = `${Constants.LC_TRANSFER_TO_}data_analyst`;
+      const wrongName = `${correctName}_analyst`;
+
+      run.Graph?.overrideTestModel(
+        ['Checking sessions and transferring', 'Handled invalid transfer'],
+        10,
+        [
+          {
+            id: 'tool_call_lookup',
+            name: 'lookup_sessions',
+            args: {},
+          } as ToolCall,
+          {
+            id: 'tool_call_wrong_handoff',
+            name: wrongName,
+            args: { instructions: 'Analyze the upload session data' },
+          } as ToolCall,
+        ]
+      );
+
+      const config: Partial<RunnableConfig> & {
+        version: 'v1' | 'v2';
+        streamMode: string;
+      } = {
+        configurable: {
+          thread_id: 'test-event-wrong-handoff-name-thread',
+        },
+        streamMode: 'values',
+        version: 'v2' as const,
+      };
+
+      await run.processStream(
+        { messages: [new HumanMessage('Check my sessions and analyze them')] },
+        config
+      );
+
+      const toolMessages = run
+        .getRunMessages()!
+        .filter((msg) => msg.getType() === 'tool') as ToolMessage[];
+      const wrongNameMessage = toolMessages.find(
+        (msg) => msg.name === wrongName
+      );
+
+      expect(executedToolNames).toEqual(['lookup_sessions']);
+      expect(wrongNameMessage).toBeDefined();
+      expect(wrongNameMessage?.status).toBe('error');
+      expect(wrongNameMessage?.content).toContain(
+        `Did you mean "${correctName}"`
+      );
+    });
+  });
+});

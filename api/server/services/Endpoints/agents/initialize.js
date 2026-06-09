@@ -139,7 +139,9 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
    *      allowlist with the toggle on = full accessible catalog. */
   const enabledCapabilities = new Set(appConfig?.endpoints?.[EModelEndpoint.agents]?.capabilities);
   const skillsCapabilityEnabled = enabledCapabilities.has(AgentCapabilities.skills);
-  const codeEnvAvailable = enabledCapabilities.has(AgentCapabilities.execute_code);
+  const codeEnvAvailable =
+    process.env.CODE_EXECUTION_ENGINE === 'local' ||
+    enabledCapabilities.has(AgentCapabilities.execute_code);
   const ephemeralSkillsToggle = req.body?.ephemeralAgent?.skills === true;
 
   const accessibleSkillIds = skillsCapabilityEnabled

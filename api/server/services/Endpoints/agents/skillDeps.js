@@ -1,6 +1,12 @@
 const crypto = require('crypto');
 const { getStrategyFunctions } = require('~/server/services/Files/strategies');
-const { batchUploadCodeEnvFiles } = require('~/server/services/Files/Code/crud');
+const { batchUploadCodeEnvFiles: batchUploadCodeEnvFilesRemote } = require('~/server/services/Files/Code/crud');
+const { batchUploadCodeEnvFilesLocal } = require('~/server/services/Files/Code/local');
+
+const batchUploadCodeEnvFiles =
+  process.env.CODE_EXECUTION_ENGINE === 'local'
+    ? batchUploadCodeEnvFilesLocal
+    : batchUploadCodeEnvFilesRemote;
 const {
   getSessionInfo,
   checkIfActive,

@@ -1,0 +1,902 @@
+/* eslint-disable @typescript-eslint/explicit-function-return-type */
+/* eslint-disable no-console */
+/**
+ * This util file contains functions for converting LangChain messages to Anthropic messages.
+ */
+import { createHash } from 'node:crypto';
+import {
+  type BaseMessage,
+  type SystemMessage,
+  HumanMessage,
+  type AIMessage,
+  type ToolMessage,
+  isAIMessage,
+  type Data,
+  type StandardContentBlockConverter,
+  MessageContentComplex,
+  isDataContentBlock,
+  convertToProviderContentBlock,
+  parseBase64DataUrl,
+} from '@langchain/core/messages';
+import { ToolCall } from '@langchain/core/messages/tool';
+import {
+  AnthropicImageBlockParam,
+  AnthropicMessageCreateParams,
+  AnthropicTextBlockParam,
+  AnthropicDocumentBlockParam,
+  AnthropicThinkingBlockParam,
+  AnthropicRedactedThinkingBlockParam,
+  AnthropicServerToolUseBlockParam,
+  AnthropicWebSearchToolResultBlockParam,
+  isAnthropicImageBlockParam,
+  AnthropicSearchResultBlockParam,
+  AnthropicCompactionBlockParam,
+  AnthropicToolResponse,
+} from '../types';
+import { Constants } from '@/common';
+
+type StandardTextBlock = Data.StandardTextBlock;
+type StandardImageBlock = Data.StandardImageBlock;
+type StandardFileBlock = Data.StandardFileBlock;
+type ImageUrlContentBlock = MessageContentComplex & {
+  image_url: string | { url: string };
+};
+type GoogleFunctionCallBlock = MessageContentComplex & {
+  functionCall: {
+    name: string;
+    args: Record<string, unknown>;
+  };
+};
+
+const ANTHROPIC_EMPTY_TEXT_PLACEHOLDER = '_';
+const CLAUDE_4_RELEASE_DATE_MODEL_PATTERN =
+  /claude-(?:opus|sonnet|haiku)-4-\d{8}(?:[-.@]|$)/i;
+const CLAUDE_4_MINOR_MODEL_PATTERN =
+  /claude-(?:opus|sonnet|haiku)-4[-.](\d+)(?:[-.@]|$)/i;
+
+function _formatImage(imageUrl: string) {
+  const parsed = parseBase64DataUrl({ dataUrl: imageUrl });
+  if (parsed) {
+    return {
+      type: 'base64',
+      media_type: parsed.mime_type,
+      data: parsed.data,
+    };
+  }
+  let parsedUrl: URL;
+
+  try {
+    parsedUrl = new URL(imageUrl);
+  } catch {
+    throw new Error(
+      [
+        `Malformed image URL: ${JSON.stringify(
+          imageUrl
+        )}. Content blocks of type 'image_url' must be a valid http, https, or base64-encoded data URL.`,
+        'Example: data:image/png;base64,/9j/4AAQSk...',
+        'Example: https://example.com/image.jpg',
+      ].join('\n\n')
+    );
+  }
+
+  if (parsedUrl.protocol === 'http:' || parsedUrl.protocol === 'https:') {
+    return {
+      type: 'url',
+      url: imageUrl,
+    };
+  }
+
+  throw new Error(
+    [
+      `Invalid image URL protocol: ${JSON.stringify(
+        parsedUrl.protocol
+      )}. Anthropic only supports images as http, https, or base64-encoded data URLs on 'image_url' content blocks.`,
+      'Example: data:image/png;base64,/9j/4AAQSk...',
+      'Example: https://example.com/image.jpg',
+    ].join('\n\n')
+  );
+}
+
+const ANTHROPIC_TOOL_USE_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
+const ANTHROPIC_TOOL_USE_ID_MAX_LENGTH = 64;
+const ANTHROPIC_TOOL_USE_ID_HASH_LENGTH = 10;
+
+/**
+ * Normalize a tool-call ID to satisfy Anthropic's `^[a-zA-Z0-9_-]+$` and 64-char
+ * constraints. Pure and deterministic — same input always yields the same output,
+ * so paired `tool_use.id` and `tool_result.tool_use_id` stay matched without
+ * needing a session map. IDs that already comply pass through unchanged.
+ *
+ * For non-compliant inputs we sanitize then append a short SHA-256 prefix of
+ * the original ID to preserve uniqueness when truncation would otherwise
+ * collapse distinct IDs to the same value (e.g. two long Responses-style IDs
+ * sharing a 64-char prefix). The hash is computed against the raw input so
+ * inputs that differ only after the truncation cutoff still produce distinct
+ * outputs.
+ */
+export function normalizeAnthropicToolCallId(id: string): string;
+export function normalizeAnthropicToolCallId(
+  id: string | undefined
+): string | undefined;
+export function normalizeAnthropicToolCallId(
+  id: string | undefined
+): string | undefined {
+  if (id == null) {
+    return id;
+  }
+  if (
+    id.length <= ANTHROPIC_TOOL_USE_ID_MAX_LENGTH &&
+    ANTHROPIC_TOOL_USE_ID_PATTERN.test(id)
+  ) {
+    return id;
+  }
+  const sanitized = id.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const hash = createHash('sha256')
+    .update(id)
+    .digest('hex')
+    .slice(0, ANTHROPIC_TOOL_USE_ID_HASH_LENGTH);
+  const prefixMaxLength =
+    ANTHROPIC_TOOL_USE_ID_MAX_LENGTH - ANTHROPIC_TOOL_USE_ID_HASH_LENGTH - 1;
+  return `${sanitized.slice(0, prefixMaxLength)}_${hash}`;
+}
+
+function _ensureMessageContents(
+  messages: BaseMessage[]
+): (SystemMessage | HumanMessage | AIMessage)[] {
+  // Merge runs of human/tool messages into single human messages with content blocks.
+  const updatedMsgs: BaseMessage[] = [];
+  for (const message of messages) {
+    if (message._getType() === 'tool') {
+      if (typeof message.content === 'string') {
+        const previousMessage = updatedMsgs[updatedMsgs.length - 1];
+        if (
+          previousMessage._getType() === 'human' &&
+          Array.isArray(previousMessage.content) &&
+          'type' in previousMessage.content[0] &&
+          previousMessage.content[0].type === 'tool_result'
+        ) {
+          // If the previous message was a tool result, we merge this tool message into it.
+          (previousMessage.content as MessageContentComplex[]).push({
+            type: 'tool_result',
+            content: message.content,
+            tool_use_id: normalizeAnthropicToolCallId(
+              (message as ToolMessage).tool_call_id
+            ),
+          });
+        } else {
+          // If not, we create a new human message with the tool result.
+          updatedMsgs.push(
+            new HumanMessage({
+              content: [
+                {
+                  type: 'tool_result',
+                  content: message.content,
+                  tool_use_id: normalizeAnthropicToolCallId(
+                    (message as ToolMessage).tool_call_id
+                  ),
+                },
+              ],
+            })
+          );
+        }
+      } else {
+        const toolMessageContent = (
+          message as { content?: BaseMessage['content'] | null }
+        ).content;
+        updatedMsgs.push(
+          new HumanMessage({
+            content: [
+              {
+                type: 'tool_result',
+                ...(toolMessageContent != null
+                  ? { content: _formatContent(message) }
+                  : {}),
+                tool_use_id: normalizeAnthropicToolCallId(
+                  (message as ToolMessage).tool_call_id
+                ),
+              },
+            ],
+          })
+        );
+      }
+    } else {
+      updatedMsgs.push(message);
+    }
+  }
+  return updatedMsgs as (SystemMessage | HumanMessage | AIMessage)[];
+}
+
+export function _convertLangChainToolCallToAnthropic(
+  toolCall: ToolCall
+): AnthropicToolResponse {
+  if (toolCall.id === undefined) {
+    throw new Error('Anthropic requires all tool calls to have an "id".');
+  }
+  const isServerTool = toolCall.id.startsWith(
+    Constants.ANTHROPIC_SERVER_TOOL_PREFIX
+  );
+  return {
+    type: isServerTool ? 'server_tool_use' : 'tool_use',
+    id: isServerTool ? toolCall.id : normalizeAnthropicToolCallId(toolCall.id),
+    name: toolCall.name,
+    input: toolCall.args,
+  };
+}
+
+const standardContentBlockConverter: StandardContentBlockConverter<{
+  text: AnthropicTextBlockParam;
+  image: AnthropicImageBlockParam;
+  file: AnthropicDocumentBlockParam;
+}> = {
+  providerName: 'anthropic',
+
+  fromStandardTextBlock(block: StandardTextBlock): AnthropicTextBlockParam {
+    return {
+      type: 'text',
+      text: block.text,
+      ...('citations' in (block.metadata ?? {})
+        ? { citations: block.metadata!.citations }
+        : {}),
+      ...('cache_control' in (block.metadata ?? {})
+        ? { cache_control: block.metadata!.cache_control }
+        : {}),
+    } as AnthropicTextBlockParam;
+  },
+
+  fromStandardImageBlock(block: StandardImageBlock): AnthropicImageBlockParam {
+    if (block.source_type === 'url') {
+      const data = parseBase64DataUrl({
+        dataUrl: block.url,
+        asTypedArray: false,
+      });
+      if (data) {
+        return {
+          type: 'image',
+          source: {
+            type: 'base64',
+            data: data.data,
+            media_type: data.mime_type,
+          },
+          ...('cache_control' in (block.metadata ?? {})
+            ? { cache_control: block.metadata!.cache_control }
+            : {}),
+        } as AnthropicImageBlockParam;
+      } else {
+        return {
+          type: 'image',
+          source: {
+            type: 'url',
+            url: block.url,
+            media_type: block.mime_type ?? '',
+          },
+          ...('cache_control' in (block.metadata ?? {})
+            ? { cache_control: block.metadata!.cache_control }
+            : {}),
+        } as AnthropicImageBlockParam;
+      }
+    } else {
+      if (block.source_type === 'base64') {
+        return {
+          type: 'image',
+          source: {
+            type: 'base64',
+            data: block.data,
+            media_type: block.mime_type ?? '',
+          },
+          ...('cache_control' in (block.metadata ?? {})
+            ? { cache_control: block.metadata!.cache_control }
+            : {}),
+        } as AnthropicImageBlockParam;
+      } else {
+        throw new Error(`Unsupported image source type: ${block.source_type}`);
+      }
+    }
+  },
+
+  fromStandardFileBlock(block: StandardFileBlock): AnthropicDocumentBlockParam {
+    const mime_type = (block.mime_type ?? '').split(';')[0];
+
+    if (block.source_type === 'url') {
+      if (mime_type === 'application/pdf' || mime_type === '') {
+        return {
+          type: 'document',
+          source: {
+            type: 'url',
+            url: block.url,
+            media_type: block.mime_type ?? '',
+          },
+          ...('cache_control' in (block.metadata ?? {})
+            ? { cache_control: block.metadata!.cache_control }
+            : {}),
+          ...('citations' in (block.metadata ?? {})
+            ? { citations: block.metadata!.citations }
+            : {}),
+          ...('context' in (block.metadata ?? {})
+            ? { context: block.metadata!.context }
+            : {}),
+          ...('title' in (block.metadata ?? {})
+            ? { title: block.metadata!.title }
+            : {}),
+        } as AnthropicDocumentBlockParam;
+      }
+      throw new Error(
+        `Unsupported file mime type for file url source: ${block.mime_type}`
+      );
+    } else if (block.source_type === 'text') {
+      if (mime_type === 'text/plain' || mime_type === '') {
+        return {
+          type: 'document',
+          source: {
+            type: 'text',
+            data: block.text,
+            media_type: block.mime_type ?? '',
+          },
+          ...('cache_control' in (block.metadata ?? {})
+            ? { cache_control: block.metadata!.cache_control }
+            : {}),
+          ...('citations' in (block.metadata ?? {})
+            ? { citations: block.metadata!.citations }
+            : {}),
+          ...('context' in (block.metadata ?? {})
+            ? { context: block.metadata!.context }
+            : {}),
+          ...('title' in (block.metadata ?? {})
+            ? { title: block.metadata!.title }
+            : {}),
+        } as AnthropicDocumentBlockParam;
+      } else {
+        throw new Error(
+          `Unsupported file mime type for file text source: ${block.mime_type}`
+        );
+      }
+    } else if (block.source_type === 'base64') {
+      if (mime_type === 'application/pdf' || mime_type === '') {
+        return {
+          type: 'document',
+          source: {
+            type: 'base64',
+            data: block.data,
+            media_type: 'application/pdf',
+          },
+          ...('cache_control' in (block.metadata ?? {})
+            ? { cache_control: block.metadata!.cache_control }
+            : {}),
+          ...('citations' in (block.metadata ?? {})
+            ? { citations: block.metadata!.citations }
+            : {}),
+          ...('context' in (block.metadata ?? {})
+            ? { context: block.metadata!.context }
+            : {}),
+          ...('title' in (block.metadata ?? {})
+            ? { title: block.metadata!.title }
+            : {}),
+        } as AnthropicDocumentBlockParam;
+      } else if (
+        ['image/jpeg', 'image/png', 'image/gif', 'image/webp'].includes(
+          mime_type
+        )
+      ) {
+        return {
+          type: 'document',
+          source: {
+            type: 'content',
+            content: [
+              {
+                type: 'image',
+                source: {
+                  type: 'base64',
+                  data: block.data,
+                  media_type: mime_type as
+                    | 'image/jpeg'
+                    | 'image/png'
+                    | 'image/gif'
+                    | 'image/webp',
+                },
+              },
+            ],
+          },
+          ...('cache_control' in (block.metadata ?? {})
+            ? { cache_control: block.metadata!.cache_control }
+            : {}),
+          ...('citations' in (block.metadata ?? {})
+            ? { citations: block.metadata!.citations }
+            : {}),
+          ...('context' in (block.metadata ?? {})
+            ? { context: block.metadata!.context }
+            : {}),
+          ...('title' in (block.metadata ?? {})
+            ? { title: block.metadata!.title }
+            : {}),
+        } as AnthropicDocumentBlockParam;
+      } else {
+        throw new Error(
+          `Unsupported file mime type for file base64 source: ${block.mime_type}`
+        );
+      }
+    } else {
+      throw new Error(`Unsupported file source type: ${block.source_type}`);
+    }
+  },
+};
+
+function _formatContent(message: BaseMessage) {
+  const toolTypes = [
+    'tool_use',
+    'tool_result',
+    'input_json_delta',
+    'server_tool_use',
+    'web_search_tool_result',
+    'web_search_result',
+  ];
+  const textTypes = ['text', 'text_delta'];
+  const { content } = message;
+
+  if (typeof content === 'string') {
+    return content;
+  } else {
+    const contentParts = content as MessageContentComplex[];
+    const contentBlocks = contentParts.map((contentPart) => {
+      /**
+       * Normalize server_tool_use blocks into a clean shape the API accepts.
+       * These blocks may arrive with the correct type (server_tool_use) or mislabeled
+       * as text/tool_use after chunk concatenation or state serialization.
+       * Regardless of current type, if the id starts with 'srvtoolu_' we rebuild
+       * a clean block with only the properties the API expects.
+       */
+      if (
+        'id' in contentPart &&
+        typeof (contentPart as Record<string, unknown>).id === 'string' &&
+        ((contentPart as Record<string, unknown>).id as string).startsWith(
+          Constants.ANTHROPIC_SERVER_TOOL_PREFIX
+        ) &&
+        'name' in contentPart
+      ) {
+        const rawPart = contentPart as Record<string, unknown>;
+        let input = rawPart.input;
+        if (typeof input === 'string') {
+          try {
+            input = JSON.parse(input);
+          } catch {
+            input = {};
+          }
+        }
+        const corrected: AnthropicServerToolUseBlockParam = {
+          type: 'server_tool_use',
+          id: rawPart.id as string,
+          name: (rawPart.name ?? 'web_search') as 'web_search',
+          input: (input ?? {}) as Record<string, unknown>,
+        };
+        return corrected;
+      }
+
+      /**
+       * Normalize web_search_tool_result blocks into a clean shape.
+       * Same rationale as above — the block may carry extra properties from
+       * streaming (input, index, etc.) that the API rejects. Rebuild cleanly.
+       */
+      if (
+        'tool_use_id' in contentPart &&
+        typeof (contentPart as Record<string, unknown>).tool_use_id ===
+          'string' &&
+        (
+          (contentPart as Record<string, unknown>).tool_use_id as string
+        ).startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) &&
+        'content' in contentPart
+      ) {
+        const rawPart = contentPart as Record<string, unknown>;
+        const content = rawPart.content;
+        const isValidContent =
+          Array.isArray(content) ||
+          (content != null &&
+            typeof content === 'object' &&
+            'type' in content &&
+            (content as Record<string, unknown>).type ===
+              'web_search_tool_result_error');
+
+        if (isValidContent) {
+          const corrected: AnthropicWebSearchToolResultBlockParam = {
+            type: 'web_search_tool_result',
+            tool_use_id: rawPart.tool_use_id as string,
+            content:
+              content as AnthropicWebSearchToolResultBlockParam['content'],
+          };
+          return corrected;
+        }
+        return null;
+      }
+
+      /**
+       * Skip non-server malformed blocks that have tool fields mixed with text type.
+       */
+      if (
+        'id' in contentPart &&
+        'name' in contentPart &&
+        'input' in contentPart &&
+        contentPart.type === 'text'
+      ) {
+        return null;
+      }
+      if (
+        'tool_use_id' in contentPart &&
+        'content' in contentPart &&
+        contentPart.type === 'text'
+      ) {
+        return null;
+      }
+
+      if (isDataContentBlock(contentPart)) {
+        return convertToProviderContentBlock(
+          contentPart,
+          standardContentBlockConverter
+        );
+      }
+
+      const cacheControl =
+        'cache_control' in contentPart ? contentPart.cache_control : undefined;
+
+      if (contentPart.type === 'image_url') {
+        let source;
+        const imageUrl = (contentPart as ImageUrlContentBlock).image_url;
+        if (typeof imageUrl === 'string') {
+          source = _formatImage(imageUrl);
+        } else {
+          source = _formatImage(imageUrl.url);
+        }
+        return {
+          type: 'image' as const, // Explicitly setting the type as "image"
+          source,
+          ...(cacheControl != null ? { cache_control: cacheControl } : {}),
+        };
+      } else if (isAnthropicImageBlockParam(contentPart)) {
+        return contentPart;
+      } else if (contentPart.type === 'document') {
+        // PDF
+        return {
+          ...contentPart,
+          ...(cacheControl != null ? { cache_control: cacheControl } : {}),
+        };
+      } else if (contentPart.type === 'thinking') {
+        const thinkingPart = contentPart as AnthropicThinkingBlockParam;
+        const block: AnthropicThinkingBlockParam = {
+          type: 'thinking' as const, // Explicitly setting the type as "thinking"
+          thinking: thinkingPart.thinking,
+          signature: thinkingPart.signature,
+          ...(cacheControl != null ? { cache_control: cacheControl } : {}),
+        };
+        return block;
+      } else if (contentPart.type === 'redacted_thinking') {
+        const redactedPart = contentPart as AnthropicRedactedThinkingBlockParam;
+        const block: AnthropicRedactedThinkingBlockParam = {
+          type: 'redacted_thinking' as const, // Explicitly setting the type as "redacted_thinking"
+          data: redactedPart.data,
+          ...(cacheControl != null ? { cache_control: cacheControl } : {}),
+        };
+        return block;
+      } else if (contentPart.type === 'search_result') {
+        const searchResultPart = contentPart as AnthropicSearchResultBlockParam;
+        const block: AnthropicSearchResultBlockParam = {
+          type: 'search_result' as const,
+          title: searchResultPart.title,
+          source: searchResultPart.source,
+          ...('cache_control' in contentPart &&
+          contentPart.cache_control != null
+            ? { cache_control: contentPart.cache_control }
+            : {}),
+          ...('citations' in contentPart && contentPart.citations != null
+            ? { citations: contentPart.citations }
+            : {}),
+          content: searchResultPart.content,
+        };
+        return block;
+      } else if (contentPart.type === 'compaction') {
+        const compactionPart = contentPart as AnthropicCompactionBlockParam;
+        const block: AnthropicCompactionBlockParam = {
+          type: 'compaction' as const,
+          content: compactionPart.content,
+          ...(cacheControl != null ? { cache_control: cacheControl } : {}),
+        };
+        return block;
+      } else if (
+        textTypes.some((t) => t === contentPart.type) &&
+        'text' in contentPart
+      ) {
+        // Assuming contentPart is of type MessageContentText here
+        return {
+          type: 'text' as const, // Explicitly setting the type as "text"
+          text: contentPart.text,
+          ...(cacheControl != null ? { cache_control: cacheControl } : {}),
+          ...('citations' in contentPart && contentPart.citations != null
+            ? { citations: contentPart.citations }
+            : {}),
+        };
+      } else if (toolTypes.some((t) => t === contentPart.type)) {
+        const contentPartCopy = { ...contentPart };
+        if ('index' in contentPartCopy) {
+          // Anthropic does not support passing the index field here, so we remove it.
+          delete contentPartCopy.index;
+        }
+
+        if (contentPartCopy.type === 'input_json_delta') {
+          // `input_json_delta` type only represents yielding partial tool inputs
+          // and is not a valid type for Anthropic messages.
+          contentPartCopy.type = 'tool_use';
+        }
+
+        if (
+          contentPartCopy.type === 'tool_use' &&
+          'id' in contentPartCopy &&
+          typeof contentPartCopy.id === 'string' &&
+          contentPartCopy.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
+        ) {
+          contentPartCopy.type = 'server_tool_use';
+        }
+
+        if ('input' in contentPartCopy) {
+          // Anthropic tool use inputs should be valid objects, when applicable.
+          if (typeof contentPartCopy.input === 'string') {
+            try {
+              contentPartCopy.input = JSON.parse(contentPartCopy.input);
+            } catch {
+              contentPartCopy.input = {};
+            }
+          }
+        }
+
+        /**
+         * For multi-turn conversations with citations, we must preserve ALL blocks
+         * including server_tool_use, web_search_tool_result, and web_search_result.
+         * Citations reference search results by index, so filtering changes indices and breaks references.
+         *
+         * The ToolNode already handles skipping server tool invocations via the srvtoolu_ prefix check.
+         */
+
+        // TODO: Fix when SDK types are fixed
+        return {
+          ...contentPartCopy,
+          ...(cacheControl != null ? { cache_control: cacheControl } : {}),
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any;
+      } else if (
+        'functionCall' in contentPart &&
+        contentPart.functionCall != null &&
+        typeof contentPart.functionCall === 'object' &&
+        isAIMessage(message)
+      ) {
+        const functionCallPart = contentPart as GoogleFunctionCallBlock;
+        const correspondingToolCall = message.tool_calls?.find(
+          (toolCall) => toolCall.name === functionCallPart.functionCall.name
+        );
+        if (!correspondingToolCall) {
+          throw new Error(
+            `Could not find tool call for function call ${functionCallPart.functionCall.name}`
+          );
+        }
+        // Google GenAI models include a `functionCall` object inside content. We should ignore it as Anthropic will not support it.
+        return {
+          id: correspondingToolCall.id,
+          type: 'tool_use',
+          name: correspondingToolCall.name,
+          input: functionCallPart.functionCall.args,
+        };
+      } else {
+        console.error(
+          'Unsupported content part:',
+          JSON.stringify(contentPart, null, 2)
+        );
+        throw new Error('Unsupported message content format');
+      }
+    });
+    const filteredContentBlocks = contentBlocks.filter(
+      (block) =>
+        block !== null &&
+        !(
+          block.type === 'text' &&
+          'text' in block &&
+          typeof block.text === 'string' &&
+          block.text.trim() === ''
+        )
+    );
+    return filteredContentBlocks.length > 0
+      ? filteredContentBlocks
+      : [{ type: 'text' as const, text: ANTHROPIC_EMPTY_TEXT_PLACEHOLDER }];
+  }
+}
+
+/**
+ * Formats messages as a prompt for the model.
+ * Used in LangSmith, export is important here.
+ * @param messages The base messages to format as a prompt.
+ * @returns The formatted prompt.
+ */
+export function _convertMessagesToAnthropicPayload(
+  messages: BaseMessage[]
+): AnthropicMessageCreateParams {
+  const mergedMessages = _ensureMessageContents(messages);
+  let system;
+  if (mergedMessages.length > 0 && mergedMessages[0]._getType() === 'system') {
+    system = messages[0].content;
+  }
+  const conversationMessages =
+    system !== undefined ? mergedMessages.slice(1) : mergedMessages;
+  const formattedMessages = conversationMessages.map((message) => {
+    let role;
+    if (message._getType() === 'human') {
+      role = 'user' as const;
+    } else if (message._getType() === 'ai') {
+      role = 'assistant' as const;
+    } else if (message._getType() === 'tool') {
+      role = 'user' as const;
+    } else if (message._getType() === 'system') {
+      throw new Error(
+        'System messages are only permitted as the first passed message.'
+      );
+    } else {
+      throw new Error(`Message type "${message._getType()}" is not supported.`);
+    }
+    const isAI = isAIMessage(message);
+    const toolCalls = isAI ? (message.tool_calls ?? []) : [];
+    if (isAI && toolCalls.length > 0) {
+      if (typeof message.content === 'string') {
+        const clientToolCalls = toolCalls.filter(
+          (tc) =>
+            !(
+              tc.id?.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) ?? false
+            )
+        );
+        if (message.content === '') {
+          return {
+            role,
+            content:
+              clientToolCalls.length > 0
+                ? clientToolCalls.map(_convertLangChainToolCallToAnthropic)
+                : [
+                  {
+                    type: 'text' as const,
+                    text: ANTHROPIC_EMPTY_TEXT_PLACEHOLDER,
+                  },
+                ],
+          };
+        } else {
+          return {
+            role,
+            content: [
+              { type: 'text' as const, text: message.content },
+              ...clientToolCalls.map(_convertLangChainToolCallToAnthropic),
+            ],
+          };
+        }
+      } else {
+        const { content } = message;
+        const hasMismatchedToolCalls = !toolCalls.every(
+          (toolCall) =>
+            !!content.find(
+              (contentPart) =>
+                (contentPart.type === 'tool_use' ||
+                  contentPart.type === 'input_json_delta' ||
+                  contentPart.type === 'server_tool_use') &&
+                contentPart.id === toolCall.id
+            )
+        );
+        if (hasMismatchedToolCalls) {
+          console.warn(
+            'The "tool_calls" field on a message is only respected if content is a string.'
+          );
+        }
+        return {
+          role,
+          content: _formatContent(message),
+        };
+      }
+    } else {
+      return {
+        role,
+        content: _formatContent(message),
+      };
+    }
+  });
+  return {
+    messages: mergeMessages(formattedMessages),
+    system,
+  } as AnthropicMessageCreateParams;
+}
+
+export function modelDisallowsAssistantPrefill(model?: string): boolean {
+  const modelId = model ?? '';
+  if (CLAUDE_4_RELEASE_DATE_MODEL_PATTERN.test(modelId)) {
+    return false;
+  }
+
+  const match = CLAUDE_4_MINOR_MODEL_PATTERN.exec(modelId);
+  if (!match) {
+    return false;
+  }
+  return Number(match[1]) >= 6;
+}
+
+export function stripUnsupportedAssistantPrefill<
+  T extends Pick<AnthropicMessageCreateParams, 'messages'> & { model?: string },
+>(request: T): T {
+  if (!modelDisallowsAssistantPrefill(request.model)) {
+    return request;
+  }
+
+  const messages = request.messages;
+  if (
+    messages.length <= 1 ||
+    messages[messages.length - 1]?.role !== 'assistant'
+  ) {
+    return request;
+  }
+
+  const nextMessages = [...messages];
+  while (
+    nextMessages.length > 1 &&
+    nextMessages[nextMessages.length - 1]?.role === 'assistant'
+  ) {
+    nextMessages.pop();
+  }
+
+  return {
+    ...request,
+    messages: nextMessages,
+  };
+}
+
+function mergeMessages(messages: AnthropicMessageCreateParams['messages']) {
+  if (messages.length <= 1) {
+    return messages;
+  }
+
+  const result: AnthropicMessageCreateParams['messages'] = [];
+  let currentMessage = messages[0];
+
+  type ContentBlocks = Exclude<
+    AnthropicMessageCreateParams['messages'][number]['content'],
+    string
+  >;
+  const normalizeContent = (
+    content: AnthropicMessageCreateParams['messages'][number]['content']
+  ): ContentBlocks => {
+    if (typeof content === 'string') {
+      return [{ type: 'text', text: content }];
+    }
+    return content;
+  };
+
+  const isToolResultMessage = (msg: (typeof messages)[0]) => {
+    if (msg.role !== 'user') return false;
+
+    if (typeof msg.content === 'string') {
+      return false;
+    }
+
+    return (
+      Array.isArray(msg.content) &&
+      msg.content.every((item) => item.type === 'tool_result')
+    );
+  };
+
+  for (let i = 1; i < messages.length; i += 1) {
+    const nextMessage = messages[i];
+
+    if (
+      isToolResultMessage(currentMessage) &&
+      isToolResultMessage(nextMessage)
+    ) {
+      // Merge the messages by combining their content arrays
+      currentMessage = {
+        ...currentMessage,
+        content: [
+          ...normalizeContent(currentMessage.content),
+          ...normalizeContent(nextMessage.content),
+        ],
+      };
+    } else {
+      result.push(currentMessage);
+      currentMessage = nextMessage;
+    }
+  }
+
+  result.push(currentMessage);
+  return result;
+}
